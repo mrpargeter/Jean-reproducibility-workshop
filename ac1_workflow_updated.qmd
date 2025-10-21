@@ -1,0 +1,339 @@
+
+---
+title: "Inter-rater reliability of lithic coding (Gwet’s AC1)"
+subtitle: "Robust Google Sheets import → inspection → AC1 → visuals"
+author: "Justin Paregter"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    code-fold: show
+execute:
+  echo: true
+  message: false
+  warning: true
+---
+
+> **Pipeline overview**
+>
+> 1) Robustly pull 6 tabs from Google Sheets (Group1/2/3 × Flakes/Cores)  
+> 2) Build *long* inspection tables tolerant to missing rows/cells  
+> 3) Summarise completeness (attributes per artefact)  
+> 4) Compute **Gwet’s AC1** per attribute (and by assemblage optional)  
+> 5) Plot **dot–whisker** and **heatmaps** for reporting
+
+## 0) Setup
+
+```{r}
+# Install once if needed:
+# install.packages(c("googlesheets4","dplyr","tidyr","stringr","purrr","forcats","ggplot2","irrCAC"), Ncpus = 2)
+
+library(googlesheets4)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(forcats)
+library(ggplot2)
+library(irrCAC)
+
+# If the Sheet is link-viewable, uncomment:
+# gs4_deauth()
+
+# Otherwise authenticate:
+# gs4_auth(email = TRUE, cache = ".secrets")
+# options(gargle_oauth_email = "you@uni.edu", gargle_oauth_cache = ".secrets")
+
+# ---- Source URL (latest) ----
+ss_url <- "https://docs.google.com/spreadsheets/d/1sRHgcU5-vPCkm51F-gCsD4-cEE6MGqXrq6uyrp3ZjAI/edit?usp=sharing"
+```
+
+## 1) Helpers
+
+```{r}
+# Parse "GroupX-Thing" -> group number + category (Flakes/Cores)
+parse_sheet_meta <- function(sheet_name) {
+  m <- stringr::str_match(sheet_name, "^Group(\\d+)-([A-Za-z]+)$")
+  list(gnum = as.integer(m[,2]), category = stringr::str_to_title(m[,3]))
+}
+
+# First mode (ties broken by first occurrence)
+mode_chr <- function(x) {
+  x <- as.character(x); x <- x[!is.na(x) & trimws(x) != ""]
+  if (!length(x)) return(NA_character_)
+  names(sort(table(x), decreasing = TRUE))[1]
+}
+
+# Robust AC1 extractor for your irrCAC structure (ac1_res$est data.frame)
+compute_gwet_ac1 <- function(df_attr) {
+  # Locate columns ignoring case; build item_id
+  asm_col <- grep("^assemblage$", names(df_attr), ignore.case = TRUE, value = TRUE)
+  art_col <- grep("^artefact",    names(df_attr), ignore.case = TRUE, value = TRUE)
+  if (length(asm_col) && length(art_col)) {
+    df_attr <- df_attr %>% mutate(item_id = paste(.data[[asm_col[1]]], .data[[art_col[1]]], sep = "-"))
+  } else if (length(art_col)) {
+    df_attr <- df_attr %>% mutate(item_id = .data[[art_col[1]]])
+  } else {
+    df_attr <- df_attr %>% mutate(item_id = dplyr::row_number())
+  }
+
+  wide <- df_attr %>%
+    select(item_id, Group, Value) %>%
+    distinct() %>%
+    pivot_wider(names_from = Group, values_from = Value) %>%
+    drop_na()               # complete cases only (per attribute)
+
+  if (nrow(wide) < 2) {
+    return(tibble::tibble(
+      n_items = nrow(wide), ac1 = NA_real_, se = NA_real_,
+      lcl = NA_real_, ucl = NA_real_, pa = NA_real_, pe = NA_real_,
+      p_value = NA_real_, weight = NA_character_, note = "Too few complete rows"
+    ))
+  }
+
+  # Recode labels to integers
+  labels <- wide %>% select(-item_id) %>% unlist(use.names = FALSE) %>% unique() %>% sort()
+  lab_to_int <- setNames(seq_along(labels), labels)
+  ratings_int <- wide %>%
+    select(-item_id) %>%
+    mutate(across(everything(), ~ unname(lab_to_int[as.character(.x)]))) %>%
+    as.matrix()
+
+  ac1_res <- irrCAC::gwet.ac1.raw(ratings_int)
+
+  if (!is.null(ac1_res$est) && is.data.frame(ac1_res$est)) {
+    est <- ac1_res$est[1, , drop = FALSE]
+    # Parse CI "(lcl,ucl)"
+    lcl <- ucl <- NA_real_
+    if (!is.null(est$conf.int) && is.character(est$conf.int)) {
+      m <- stringr::str_match(est$conf.int, "\\(([-+0-9.eE]+),\\s*([-+0-9.eE]+)\\)")
+      if (all(!is.na(m[1,2:3]))) { lcl <- as.numeric(m[1,2]); ucl <- as.numeric(m[1,3]) }
+    }
+    return(tibble::tibble(
+      n_items = nrow(wide),
+      ac1     = as.numeric(est$coeff.val),
+      se      = as.numeric(est$coeff.se),
+      lcl = lcl, ucl = ucl,
+      pa  = as.numeric(est$pa), pe = as.numeric(est$pe),
+      p_value = as.numeric(est$p.value),
+      weight  = as.character(est$w.name),
+      note = ""
+    ))
+  }
+
+  tibble::tibble(
+    n_items = nrow(wide), ac1 = NA_real_, se = NA_real_,
+    lcl = NA_real_, ucl = NA_real_, pa = NA_real_, pe = NA_real_,
+    p_value = NA_real_, weight = NA_character_,
+    note = "Unexpected irrCAC structure; inspect with str(ac1_res)"
+  )
+}
+
+# Within-facet ordering helpers for plots
+reorder_within <- function(x, by, within, fun = mean, sep = "___") {
+  interaction <- paste(x, within, sep = sep)
+  stats::reorder(interaction, by, FUN = fun)
+}
+scale_y_reordered <- function(sep = "___") {
+  scale_y_discrete(labels = function(x) sub(paste0(sep, ".*$"), "", x))
+}
+```
+
+## 2) Robust Google Sheets import (tolerant to missing data)
+
+```{r}
+# Read one tab → long rows
+read_tab_minimal <- function(sheet_name, artefacts_per_assemblage = 5L) {
+  meta <- parse_sheet_meta(sheet_name)
+
+  df <- read_sheet(ss_url, sheet = sheet_name) %>%
+    mutate(across(everything(), as.character))
+
+  if (ncol(df) < 3) stop(sprintf("Tab `%s` has <3 columns.", sheet_name))
+  names(df)[1:2] <- c("ID1","ID2")
+
+  # Attribute columns = non-empty headers from C onward (all-empty columns dropped)
+  raw_attr <- names(df)[3:ncol(df)]
+  keep_hdr <- raw_attr[trimws(raw_attr) != ""]
+  keep_col <- vapply(df[keep_hdr], function(z) any(!is.na(z) & trimws(z) != ""), logical(1))
+  attrs <- keep_hdr[keep_col]
+  if (!length(attrs)) return(tibble())
+
+  # Keep rows with any attribute content (or a non-empty ID2)
+  row_is_data <- apply(df[attrs], 1, function(v) any(!is.na(v) & trimws(v) != "")) |
+                 (!is.na(df$ID2) & trimws(df$ID2) != "")
+  dfx <- df[row_is_data, , drop = FALSE]
+  if (!nrow(dfx)) return(tibble())
+
+  # Stable IDs: prefer "Assemblage <n>" in ID1; else infer by row order (blocks of 5)
+  dfx <- dfx %>%
+    mutate(.i = row_number(),
+           Assemblage = if_else(!is.na(ID1) & str_detect(ID1, "(?i)assemblage\\s*\\d+"),
+                                str_extract(ID1, "\\d+"),
+                                as.character(ceiling(.i / artefacts_per_assemblage))),
+           `Artefact number` = if_else(!is.na(suppressWarnings(as.integer(ID2))),
+                                       as.character(as.integer(ID2)),
+                                       as.character((.i - 1) %% artefacts_per_assemblage + 1)),
+           Group = meta$gnum,
+           category = meta$category)
+
+  # Long + collapse duplicates by mode so widening later is clean
+  dfx %>%
+    pivot_longer(all_of(attrs), names_to = "Attribute", values_to = "Value") %>%
+    summarise(Value = mode_chr(Value),
+              .by = c(category, Assemblage, `Artefact number`, Group, Attribute)) %>%
+    arrange(as.integer(Assemblage), as.integer(`Artefact number`), Group, Attribute)
+}
+
+# Read only the expected tabs
+tabs <- sheet_names(ss_url)
+tabs <- tabs[str_detect(tabs, "^Group[123]-(Flakes|Cores)$")]
+
+long_all <- map_dfr(tabs, read_tab_minimal)
+
+# Long inspection tables
+flakes_long_chk <- long_all %>% filter(category == "Flakes") %>% select(-category)
+cores_long_chk  <- long_all %>% filter(category == "Cores")  %>% select(-category)
+
+# Quick peek
+flakes_long_chk %>% count(Attribute) %>% arrange(desc(n))
+cores_long_chk  %>% count(Attribute) %>% arrange(desc(n))
+```
+
+## 3) Completeness snapshots (so `n_items` differences are transparent)
+
+```{r}
+EXPECTED_FLAKE_ATTR <- 8L
+EXPECTED_CORE_ATTR  <- 7L
+
+flakes_summary <- flakes_long_chk %>%
+  summarise(n_attributes = dplyr::n(), .by = c(Assemblage, `Artefact number`, Group)) %>%
+  arrange(as.integer(Assemblage), as.integer(`Artefact number`), Group)
+
+cores_summary <- cores_long_chk %>%
+  summarise(n_attributes = dplyr::n(), .by = c(Assemblage, `Artefact number`, Group)) %>%
+  arrange(as.integer(Assemblage), as.integer(`Artefact number`), Group)
+
+flakes_issues <- filter(flakes_summary, n_attributes < EXPECTED_FLAKE_ATTR)
+cores_issues  <- filter(cores_summary,  n_attributes < EXPECTED_CORE_ATTR)
+
+list(
+  flakes_ok = sum(flakes_summary$n_attributes == EXPECTED_FLAKE_ATTR),
+  flakes_total = nrow(flakes_summary),
+  cores_ok = sum(cores_summary$n_attributes == EXPECTED_CORE_ATTR),
+  cores_total = nrow(cores_summary)
+)
+```
+
+## 4) AC1 per attribute (Flakes & Cores)
+
+```{r}
+get_ac1_by_attribute <- function(long_df, category_label) {
+  long_df %>%
+    group_by(Attribute) %>%
+    group_modify(~ compute_gwet_ac1(.x)) %>%
+    ungroup() %>%
+    mutate(category = category_label) %>%
+    select(category, Attribute, n_items, ac1, se, lcl, ucl, pa, pe, p_value, weight, note) %>%
+    arrange(Attribute)
+}
+
+ac1_flakes <- get_ac1_by_attribute(flakes_long_chk, "Flakes")
+ac1_cores  <- get_ac1_by_attribute(cores_long_chk,  "Cores")
+
+ac1_summary <- bind_rows(ac1_flakes, ac1_cores) %>%
+  mutate(ac1 = round(ac1, 3), se = round(se, 3),
+         lcl = round(lcl, 3), ucl = round(ucl, 3),
+         pa = round(pa, 3), pe = round(pe, 3))
+
+# Reporting table
+ac1_table <- ac1_summary %>%
+  arrange(category, Attribute) %>%
+  transmute(category, Attribute, n_items,
+            AC1 = ac1,
+            `95% CI` = ifelse(is.finite(lcl) & is.finite(ucl),
+                              sprintf("[%.3f, %.3f]", lcl, ucl), "NA"),
+            `p-value` = signif(p_value, 3), weight)
+ac1_table
+```
+
+## 5) Visuals (Type only)
+
+```{r}
+# Within-facet ordering for readability
+ac1_plot_df <- ac1_summary %>%
+  mutate(category = factor(category, levels = c("Flakes","Cores")),
+         facet = category,
+         Attribute_ord = reorder_within(Attribute, ac1, facet, fun = mean))
+
+# Dot–whisker (AC1 ± 95% CI)
+p_ac1 <- ggplot(ac1_plot_df, aes(x = ac1, y = Attribute_ord)) +
+  annotate("rect", xmin = 0.81, xmax = 1.00, ymin = -Inf, ymax = Inf, alpha = 0.05) +
+  annotate("rect", xmin = 0.61, xmax = 0.80, ymin = -Inf, ymax = Inf, alpha = 0.05) +
+  annotate("rect", xmin = 0.41, xmax = 0.60, ymin = -Inf, ymax = Inf, alpha = 0.05) +
+  annotate("rect", xmin = 0.21, xmax = 0.40, ymin = -Inf, ymax = Inf, alpha = 0.05) +
+  geom_errorbarh(aes(xmin = lcl, xmax = ucl), height = 0.2, na.rm = TRUE) +
+  geom_point(size = 2) +
+  facet_wrap(~ category, scales = "free_y") +
+  scale_y_reordered() +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, .1)) +
+  labs(title = "Inter-rater reliability (Gwet’s AC1 ± 95% CI)",
+       x = "Gwet’s AC1", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+p_ac1
+```
+
+```{r}
+# Heatmap (quick scan)
+ac1_heat_df <- ac1_summary %>%
+  mutate(category = factor(category, levels = c("Flakes","Cores")),
+         Attribute = fct_reorder(Attribute, ac1, .fun = mean, .desc = TRUE))
+
+p_heat <- ggplot(ac1_heat_df, aes(x = category, y = Attribute, fill = ac1)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = ifelse(is.finite(ac1), sprintf("%.2f", ac1), "NA")), size = 3) +
+  scale_fill_gradient(limits = c(0,1), low = "white", high = "steelblue", na.value = "grey90") +
+  labs(title = "Agreement (AC1) by attribute and type", x = NULL, y = NULL, fill = "AC1") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+p_heat
+```
+
+## 6) (Optional) AC1 by Assemblage
+
+```{r}
+ac1_flakes_byAsm <- flakes_long_chk %>%
+  group_by(Assemblage, Attribute) %>%
+  group_modify(~ compute_gwet_ac1(.x)) %>%
+  ungroup() %>% mutate(category = "Flakes")
+
+ac1_cores_byAsm <- cores_long_chk %>%
+  group_by(Assemblage, Attribute) %>%
+  group_modify(~ compute_gwet_ac1(.x)) %>%
+  ungroup() %>% mutate(category = "Cores")
+
+ac1_byAsm <- bind_rows(ac1_flakes_byAsm, ac1_cores_byAsm) %>%
+  mutate(category = factor(category, levels = c("Flakes","Cores")),
+         Assemblage = factor(Assemblage, levels = c("1","2","3")),
+         Attribute  = factor(Attribute))
+
+p_heat_byAsm <- ac1_byAsm %>%
+  mutate(Attribute = fct_reorder(Attribute, ac1, .fun = mean, .desc = TRUE)) %>%
+  ggplot(aes(x = Assemblage, y = Attribute, fill = ac1)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = ifelse(is.finite(ac1), sprintf("%.2f", ac1), "NA")), size = 3) +
+  facet_wrap(~ category, ncol = 2, scales = "free_y") +
+  scale_fill_gradient(limits = c(0,1), low = "white", high = "steelblue", na.value = "grey90") +
+  labs(title = "Agreement (AC1) by attribute, type, and assemblage",
+       x = "Assemblage", y = NULL, fill = "AC1") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+p_heat_byAsm
+```
+
+## 7) Session info
+
+```{r}
+sessionInfo()
+```
