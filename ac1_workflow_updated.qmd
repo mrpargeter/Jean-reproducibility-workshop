@@ -45,7 +45,7 @@ library(irrCAC)
 # options(gargle_oauth_email = "you@uni.edu", gargle_oauth_cache = ".secrets")
 
 # ---- Source URL (latest) ----
-ss_url <- "https://docs.google.com/spreadsheets/d/1sRHgcU5-vPCkm51F-gCsD4-cEE6MGqXrq6uyrp3ZjAI/edit?usp=sharing"
+ss_url <- "https://docs.google.com/spreadsheets/d/16wZOJoc2s6q6XCLmfmV_AGS-O8OQ0GRNbva_Oa5vRv0/edit?usp=sharing"
 ```
 
 ## 1) Helpers
@@ -286,15 +286,24 @@ p_ac1
 
 ```{r}
 # Heatmap (quick scan)
-ac1_heat_df <- ac1_summary %>%
-  mutate(category = factor(category, levels = c("Flakes","Cores")),
-         Attribute = fct_reorder(Attribute, ac1, .fun = mean, .desc = TRUE))
+# NA-safe mean for ordering
+mean_na <- function(x) mean(x, na.rm = TRUE)
 
-p_heat <- ggplot(ac1_heat_df, aes(x = category, y = Attribute, fill = ac1)) +
+ac1_heat_df <- ac1_summary %>%
+  mutate(
+    category = factor(category, levels = c("Flakes","Cores")),
+    Attribute = as.character(Attribute),  # ensure it's not a weird factor/list
+    facet = category,
+    Attribute_ord = reorder_within(Attribute, ac1, facet, fun = mean_na)
+  )
+
+p_heat <- ggplot(ac1_heat_df, aes(x = category, y = Attribute_ord, fill = ac1)) +
   geom_tile(color = "white") +
   geom_text(aes(label = ifelse(is.finite(ac1), sprintf("%.2f", ac1), "NA")), size = 3) +
+  scale_y_reordered() +                                   # strip facet suffix
   scale_fill_gradient(limits = c(0,1), low = "white", high = "steelblue", na.value = "grey90") +
-  labs(title = "Agreement (AC1) by attribute and type", x = NULL, y = NULL, fill = "AC1") +
+  labs(title = "Agreement (AC1) by attribute and type",
+       x = NULL, y = NULL, fill = "AC1") +
   theme_minimal(base_size = 12) +
   theme(panel.grid = element_blank())
 p_heat
